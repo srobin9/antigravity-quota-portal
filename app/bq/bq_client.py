@@ -124,6 +124,15 @@ class UserUsageRecord(BaseModel):
     last_active: datetime | None = None
 
 
+_METADATA_TABLE_PREFIX = "businessaicode_googleapis_com_metadata"
+_INFERENCE_RESPONSE_TABLE_PREFIX = "businessaicode_googleapis_com_inference_response"
+
+_LOG_STREAM_SPECS: tuple[tuple[str, str], ...] = (
+    (_METADATA_TABLE_PREFIX, "jsonpayload_v1_metadatalog.metadata"),
+    (_INFERENCE_RESPONSE_TABLE_PREFIX, "jsonpayload_v1_inferenceresponselog.metadata"),
+)
+
+
 class BigQueryUsageClient:
     """Production BigQuery client for querying inference audit logs."""
 
@@ -135,11 +144,11 @@ class BigQueryUsageClient:
         self.default_workload_project_id = default_workload_project_id or project_id
         self.client = bigquery.Client(project=project_id)
         self._cache_lock = threading.RLock()
-        self._table_pattern_cache: tuple[float, tuple[bool, bool]] | None = None
+        self._table_pattern_cache: tuple[float, dict[str, tuple[bool, bool]]] | None = None
         self._table_pattern_ttl_seconds: float = 60.0
 
-    def _check_table_patterns(self) -> tuple[bool, bool]:
-        """Detect whether date-sharded (*_YYYYMMDD) and/or unsharded tables exist in the dataset."""
+    def _check_stream_table_patterns(self) -> dict[str, tuple[bool, bool]]:
+        """Detect date-sharded (*_YYYYMMDD) and/or unsharded tables per supported log stream."""
         now_epoch = datetime.now(UTC).timestamp()
         with self._cache_lock:
             if (
@@ -148,7 +157,11 @@ class BigQueryUsageClient:
             ):
                 return self._table_pattern_cache[1]
 
-        result = (True, True)
+        default_result: dict[str, tuple[bool, bool]] = {
+            _METADATA_TABLE_PREFIX: (True, True),
+            _INFERENCE_RESPONSE_TABLE_PREFIX: (False, False),
+        }
+        result = dict(default_result)
         if hasattr(self.client, "list_tables"):
             try:
                 tables = list(self.client.list_tables(f"{self.project_id}.{self.dataset_name}"))
@@ -158,23 +171,27 @@ class BigQueryUsageClient:
                     if isinstance(getattr(t, "table_id", None), str)
                 ]
                 if table_ids:
-                    has_sharded = any(
-                        tid.startswith("businessaicode_googleapis_com_metadata_")
-                        for tid in table_ids
-                    )
-                    has_unsharded = any(
-                        tid == "businessaicode_googleapis_com_metadata"
-                        for tid in table_ids
-                    )
-                    if has_sharded or has_unsharded:
-                        result = (has_sharded, has_unsharded)
+                    detected: dict[str, tuple[bool, bool]] = {}
+                    found_any = False
+                    for table_prefix, _ in _LOG_STREAM_SPECS:
+                        has_sharded = any(tid.startswith(f"{table_prefix}_") for tid in table_ids)
+                        has_unsharded = any(tid == table_prefix for tid in table_ids)
+                        detected[table_prefix] = (has_sharded, has_unsharded)
+                        if has_sharded or has_unsharded:
+                            found_any = True
+                    if found_any:
+                        result = detected
             except Exception as e:
                 logger.debug(f"Could not list BigQuery tables for pattern detection: {e}")
-                return (True, True)
+                return default_result
 
         with self._cache_lock:
             self._table_pattern_cache = (now_epoch, result)
         return result
+
+    def _check_table_patterns(self) -> tuple[bool, bool]:
+        """Detect whether date-sharded (*_YYYYMMDD) and/or unsharded metadata tables exist in the dataset."""
+        return self._check_stream_table_patterns().get(_METADATA_TABLE_PREFIX, (True, True))
 
     def _build_usage_query(
         self,
@@ -183,12 +200,16 @@ class BigQueryUsageClient:
         exclude_sharded_insert_ids: bool = False,
         context_tier_threshold_tokens: int = 200000,
         default_workload_project_id: str | None = None,
+        table_prefix: str = _METADATA_TABLE_PREFIX,
+        metadata_expr: str = "jsonpayload_v1_metadatalog.metadata",
     ) -> str:
         """Build the BigQuery SQL query for either date-sharded (*_YYYYMMDD) or unsharded/view tables."""
         if not _IDENTIFIER_RE.match(str(self.project_id or "")) or not _IDENTIFIER_RE.match(
             str(self.dataset_name or "")
         ):
             raise ValueError(f"Invalid BigQuery project_id or dataset_name: {self.project_id}.{self.dataset_name}")
+        if not _IDENTIFIER_RE.match(str(table_prefix or "")) or not _IDENTIFIER_RE.match(str(metadata_expr or "")):
+            raise ValueError(f"Invalid BigQuery table_prefix or metadata_expr: {table_prefix} / {metadata_expr}")
 
         table_suffix = "_*" if use_wildcard_shards else ""
         shard_filter = (
@@ -203,7 +224,7 @@ class BigQueryUsageClient:
               OR insertId = ''
               OR insertId NOT IN (
                 SELECT insertId
-                FROM `{self.project_id}.{self.dataset_name}.businessaicode_googleapis_com_metadata_*`
+                FROM `{self.project_id}.{self.dataset_name}.{table_prefix}_*`
                 WHERE timestamp >= @min_start_timestamp_utc
                   AND timestamp <= @end_timestamp_utc
                   AND _TABLE_SUFFIX BETWEEN FORMAT_TIMESTAMP('%Y%m%d', @min_start_timestamp_utc)
@@ -236,15 +257,15 @@ class BigQueryUsageClient:
           SELECT
             timestamp,
             COALESCE(
-              resource.labels.project_id,
-              REGEXP_EXTRACT(logName, r'^projects/([^/]+)/'),
+              NULLIF(JSON_VALUE(TO_JSON_STRING(resource), '$.labels.project_id'), ''),
+              NULLIF(REGEXP_EXTRACT(logName, r'^projects/([^/]+)/'), ''),
               @fallback_project_id
             ) AS project_id,
             LOWER(TRIM(REGEXP_REPLACE(labels.user_id, r'^(?i)user:', ''))) AS user_email,
             COALESCE(NULLIF(TRIM(labels.model), ''), 'gemini-3.8-flash') AS model_name,
-            TO_JSON_STRING(jsonpayload_v1_metadatalog.metadata) AS meta_json
+            TO_JSON_STRING({metadata_expr}) AS meta_json
           FROM
-            `{self.project_id}.{self.dataset_name}.businessaicode_googleapis_com_metadata{table_suffix}`
+            `{self.project_id}.{self.dataset_name}.{table_prefix}{table_suffix}`
           WHERE
             timestamp >= @min_start_timestamp_utc
             AND timestamp <= @end_timestamp_utc
@@ -418,6 +439,122 @@ class BigQueryUsageClient:
                     existing.last_active = rec_last_active
         return list(merged.values())
 
+    def _fetch_stream_usage(
+        self,
+        *,
+        table_prefix: str,
+        metadata_expr: str,
+        has_sharded: bool,
+        has_unsharded: bool,
+        job_config: bigquery.QueryJobConfig,
+        norm_project_start_map: dict[str, datetime] | None,
+        context_tier_threshold_tokens: int,
+        default_workload_project_id: str | None,
+    ) -> list[UserUsageRecord]:
+        """Fetch records for a single BigQuery log stream (sharded and/or partitioned table)."""
+        if not has_sharded and not has_unsharded:
+            return []
+
+        if not has_sharded and has_unsharded:
+            try:
+                unsharded_query = self._build_usage_query(
+                    use_wildcard_shards=False,
+                    project_start_map=norm_project_start_map,
+                    exclude_sharded_insert_ids=False,
+                    context_tier_threshold_tokens=context_tier_threshold_tokens,
+                    default_workload_project_id=default_workload_project_id,
+                    table_prefix=table_prefix,
+                    metadata_expr=metadata_expr,
+                )
+                return self._execute_query(
+                    unsharded_query,
+                    job_config,
+                    default_workload_project_id=default_workload_project_id,
+                )
+            except Exception as e:
+                if _is_benign_missing_table_error(e):
+                    logger.info(f"Unsharded BigQuery table '{table_prefix}' not found ({e}); returning empty usage.")
+                    return []
+                logger.error(f"Fatal error querying BigQuery usage for '{table_prefix}': {e}", exc_info=True)
+                raise
+
+        try:
+            sharded_query = self._build_usage_query(
+                use_wildcard_shards=True,
+                project_start_map=norm_project_start_map,
+                context_tier_threshold_tokens=context_tier_threshold_tokens,
+                default_workload_project_id=default_workload_project_id,
+                table_prefix=table_prefix,
+                metadata_expr=metadata_expr,
+            )
+            sharded_records = self._execute_query(
+                sharded_query,
+                job_config,
+                default_workload_project_id=default_workload_project_id,
+            )
+            if not has_unsharded:
+                return sharded_records
+            try:
+                unsharded_query = self._build_usage_query(
+                    use_wildcard_shards=False,
+                    project_start_map=norm_project_start_map,
+                    exclude_sharded_insert_ids=True,
+                    context_tier_threshold_tokens=context_tier_threshold_tokens,
+                    default_workload_project_id=default_workload_project_id,
+                    table_prefix=table_prefix,
+                    metadata_expr=metadata_expr,
+                )
+                unsharded_records = self._execute_query(
+                    unsharded_query,
+                    job_config,
+                    default_workload_project_id=default_workload_project_id,
+                )
+                return sharded_records + unsharded_records
+            except Exception as e:
+                if not _is_benign_missing_table_error(e):
+                    logger.error(
+                        f"Fatal error on secondary partitioned table query for '{table_prefix}': {e}",
+                        exc_info=True,
+                    )
+                    raise
+                logger.debug(f"Secondary partitioned table query skipped or failed for '{table_prefix}': {e}")
+                return sharded_records
+        except Exception as sharded_err:
+            if not _is_benign_missing_table_error(sharded_err):
+                logger.error(
+                    f"Fatal error querying BigQuery sharded tables for '{table_prefix}': {sharded_err}",
+                    exc_info=True,
+                )
+                raise
+            if not has_unsharded:
+                logger.info(f"Wildcard sharded table query did not match for '{table_prefix}' ({sharded_err}).")
+                return []
+            logger.info(
+                f"Wildcard sharded table query did not match for '{table_prefix}' ({sharded_err}); "
+                "falling back to unsharded table/view."
+            )
+            try:
+                unsharded_query = self._build_usage_query(
+                    use_wildcard_shards=False,
+                    project_start_map=norm_project_start_map,
+                    exclude_sharded_insert_ids=False,
+                    context_tier_threshold_tokens=context_tier_threshold_tokens,
+                    default_workload_project_id=default_workload_project_id,
+                    table_prefix=table_prefix,
+                    metadata_expr=metadata_expr,
+                )
+                return self._execute_query(
+                    unsharded_query,
+                    job_config,
+                    default_workload_project_id=default_workload_project_id,
+                )
+            except Exception as e:
+                if _is_benign_missing_table_error(e):
+                    logger.info(f"Unsharded fallback table '{table_prefix}' not found ({e}); returning empty usage.")
+                    return []
+                logger.error(f"Fatal error querying BigQuery usage for '{table_prefix}': {e}", exc_info=True)
+                raise
+
     def fetch_weekly_usage(
         self,
         start_utc: datetime,
@@ -428,10 +565,11 @@ class BigQueryUsageClient:
     ) -> list[UserUsageRecord]:
         """Fetch aggregated token usage per user and model within the UTC time range.
 
-        Queries date-sharded tables (`businessaicode_googleapis_com_metadata_*`)
-        and the partitioned table (`businessaicode_googleapis_com_metadata`),
-        deduplicating by `insertId` across both tables when both exist, and falls back
-        cleanly if either table is absent. Re-raises fatal BigQuery errors (e.g., 403/500).
+        Queries both `businessaicode_googleapis_com_metadata` (emitted when only
+        Metadata logging is enabled) and `businessaicode_googleapis_com_inference_response`
+        (emitted when Prompts & Responses logging is also enabled), supporting both
+        date-sharded (`_*`) and time-partitioned tables with `insertId` deduplication.
+        Re-raises fatal BigQuery errors (e.g., 403/500).
         """
         start_utc = _ensure_utc(start_utc)
         end_utc = _ensure_utc(end_utc)
@@ -455,91 +593,22 @@ class BigQueryUsageClient:
             ]
         )
 
-        has_sharded, has_unsharded = self._check_table_patterns()
-
-        if not has_sharded and has_unsharded:
-            try:
-                unsharded_query = self._build_usage_query(
-                    use_wildcard_shards=False,
-                    project_start_map=norm_project_start_map,
-                    exclude_sharded_insert_ids=False,
+        stream_patterns = self._check_stream_table_patterns()
+        all_records: list[UserUsageRecord] = []
+        for table_prefix, metadata_expr in _LOG_STREAM_SPECS:
+            has_sharded, has_unsharded = stream_patterns.get(table_prefix, (False, False))
+            if not has_sharded and not has_unsharded:
+                continue
+            all_records.extend(
+                self._fetch_stream_usage(
+                    table_prefix=table_prefix,
+                    metadata_expr=metadata_expr,
+                    has_sharded=has_sharded,
+                    has_unsharded=has_unsharded,
+                    job_config=job_config,
+                    norm_project_start_map=norm_project_start_map,
                     context_tier_threshold_tokens=context_tier_threshold_tokens,
                     default_workload_project_id=default_workload_project_id,
                 )
-                return self._merge_records(
-                    self._execute_query(
-                        unsharded_query,
-                        job_config,
-                        default_workload_project_id=default_workload_project_id,
-                    )
-                )
-            except Exception as e:
-                if _is_benign_missing_table_error(e):
-                    logger.info(f"Unsharded BigQuery table not found ({e}); returning empty usage.")
-                    return []
-                logger.error(f"Fatal error querying BigQuery usage: {e}", exc_info=True)
-                raise
-
-        try:
-            sharded_query = self._build_usage_query(
-                use_wildcard_shards=True,
-                project_start_map=norm_project_start_map,
-                context_tier_threshold_tokens=context_tier_threshold_tokens,
-                default_workload_project_id=default_workload_project_id,
             )
-            sharded_records = self._execute_query(
-                sharded_query,
-                job_config,
-                default_workload_project_id=default_workload_project_id,
-            )
-            if not has_unsharded:
-                return self._merge_records(sharded_records)
-            try:
-                unsharded_query = self._build_usage_query(
-                    use_wildcard_shards=False,
-                    project_start_map=norm_project_start_map,
-                    exclude_sharded_insert_ids=True,
-                    context_tier_threshold_tokens=context_tier_threshold_tokens,
-                    default_workload_project_id=default_workload_project_id,
-                )
-                unsharded_records = self._execute_query(
-                    unsharded_query,
-                    job_config,
-                    default_workload_project_id=default_workload_project_id,
-                )
-                return self._merge_records(sharded_records + unsharded_records)
-            except Exception as e:
-                if not _is_benign_missing_table_error(e):
-                    logger.error(f"Fatal error on secondary partitioned table query: {e}", exc_info=True)
-                    raise
-                logger.debug(f"Secondary partitioned table query skipped or failed: {e}")
-                return self._merge_records(sharded_records)
-        except Exception as sharded_err:
-            if not _is_benign_missing_table_error(sharded_err):
-                logger.error(f"Fatal error querying BigQuery sharded tables: {sharded_err}", exc_info=True)
-                raise
-            logger.info(
-                f"Wildcard sharded table query did not match ({sharded_err}); "
-                "falling back to unsharded table/view."
-            )
-            try:
-                unsharded_query = self._build_usage_query(
-                    use_wildcard_shards=False,
-                    project_start_map=norm_project_start_map,
-                    exclude_sharded_insert_ids=False,
-                    context_tier_threshold_tokens=context_tier_threshold_tokens,
-                    default_workload_project_id=default_workload_project_id,
-                )
-                return self._merge_records(
-                    self._execute_query(
-                        unsharded_query,
-                        job_config,
-                        default_workload_project_id=default_workload_project_id,
-                    )
-                )
-            except Exception as e:
-                if _is_benign_missing_table_error(e):
-                    logger.info(f"Unsharded fallback table not found ({e}); returning empty usage.")
-                    return []
-                logger.error(f"Fatal error querying BigQuery usage: {e}", exc_info=True)
-                raise
+        return self._merge_records(all_records)

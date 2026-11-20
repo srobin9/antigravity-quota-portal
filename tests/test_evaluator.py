@@ -1279,6 +1279,119 @@ def test_verify_live_deployment_live_bigquery_dml_seeding_and_cleanup():
     assert "DELETE FROM `host-proj.antigravity_audit_logs.businessaicode_googleapis_com_metadata`" in executed_sql
 
 
+def test_bq_client_queries_inference_response_table_with_schema_safe_project_id():
+    """Verify inference_response querying and schema-safe project_id extraction."""
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from app.bq.bq_client import BigQueryUsageClient
+
+    mock_gcp_bq = MagicMock()
+    mock_gcp_bq.list_tables.return_value = [
+        SimpleNamespace(table_id="businessaicode_googleapis_com_inference_request"),
+        SimpleNamespace(table_id="businessaicode_googleapis_com_inference_response"),
+        SimpleNamespace(table_id="businessaicode_googleapis_com_client_telemetry"),
+    ]
+    row = {
+        "project_id": "p-khm8-dev-svc",
+        "user_email": "admin@kimhakmin.altostrat.com",
+        "model_name": "gemini-4-carbon",
+        "request_count": 29,
+        "token_count": 1345100,
+        "prompt_tokens": 1300000,
+        "candidates_tokens": 25100,
+        "cached_tokens": 1000000,
+        "thoughts_tokens": 20000,
+        "fallback_tokens": 0,
+        "last_active": datetime(2026, 11, 20, 1, 33, 50, tzinfo=UTC),
+    }
+    job = MagicMock()
+    job.result.return_value = [row]
+    mock_gcp_bq.query.return_value = job
+
+    with patch("app.bq.bq_client.bigquery.Client", return_value=mock_gcp_bq):
+        client = BigQueryUsageClient(project_id="p-khm8-dev-svc", dataset_name="antigravity_inference_logs")
+
+    records = client.fetch_weekly_usage(
+        datetime(2026, 11, 20, 0, 38, 16, tzinfo=UTC),
+        datetime(2026, 11, 20, 2, 0, 0, tzinfo=UTC),
+    )
+
+    assert mock_gcp_bq.query.call_count == 1
+    sql = mock_gcp_bq.query.call_args_list[0][0][0]
+    assert "`p-khm8-dev-svc.antigravity_inference_logs.businessaicode_googleapis_com_inference_response`" in sql
+    assert "TO_JSON_STRING(jsonpayload_v1_inferenceresponselog.metadata) AS meta_json" in sql
+    assert "JSON_VALUE(TO_JSON_STRING(resource), '$.labels.project_id')" in sql
+    assert "resource.labels.project_id" not in sql
+    assert len(records) == 1
+    assert records[0].user_email == "admin@kimhakmin.altostrat.com"
+    assert records[0].model_name == "gemini-4-carbon"
+    assert records[0].request_count == 29
+    assert records[0].token_count == 1345100
 
 
+def test_bq_client_merges_metadata_and_inference_response_streams():
+    """Verify BigQueryUsageClient queries and merges records when both metadata and inference_response tables exist."""
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+    from unittest.mock import patch
 
+    from app.bq.bq_client import BigQueryUsageClient
+
+    mock_gcp_bq = MagicMock()
+    mock_gcp_bq.list_tables.return_value = [
+        SimpleNamespace(table_id="businessaicode_googleapis_com_metadata"),
+        SimpleNamespace(table_id="businessaicode_googleapis_com_inference_response"),
+    ]
+    meta_job = MagicMock()
+    meta_job.result.return_value = [
+        {
+            "project_id": "workload-proj",
+            "user_email": "dev@example.com",
+            "model_name": "gemini-4-carbon",
+            "request_count": 2,
+            "token_count": 10000,
+            "prompt_tokens": 8000,
+            "candidates_tokens": 1500,
+            "cached_tokens": 2000,
+            "thoughts_tokens": 500,
+            "fallback_tokens": 0,
+            "last_active": datetime(2026, 11, 20, 0, 40, 0, tzinfo=UTC),
+        }
+    ]
+    resp_job = MagicMock()
+    resp_job.result.return_value = [
+        {
+            "project_id": "workload-proj",
+            "user_email": "dev@example.com",
+            "model_name": "gemini-4-carbon",
+            "request_count": 3,
+            "token_count": 20000,
+            "prompt_tokens": 16000,
+            "candidates_tokens": 3000,
+            "cached_tokens": 5000,
+            "thoughts_tokens": 1000,
+            "fallback_tokens": 0,
+            "last_active": datetime(2026, 11, 20, 1, 10, 0, tzinfo=UTC),
+        }
+    ]
+    mock_gcp_bq.query.side_effect = [meta_job, resp_job]
+
+    with patch("app.bq.bq_client.bigquery.Client", return_value=mock_gcp_bq):
+        client = BigQueryUsageClient(project_id="host-proj", dataset_name="antigravity_logs")
+
+    records = client.fetch_weekly_usage(
+        datetime(2026, 11, 20, 0, 0, 0, tzinfo=UTC),
+        datetime(2026, 11, 20, 2, 0, 0, tzinfo=UTC),
+    )
+
+    assert mock_gcp_bq.query.call_count == 2
+    assert len(records) == 1
+    assert records[0].request_count == 5
+    assert records[0].token_count == 30000
+    assert records[0].prompt_tokens == 24000
+    assert records[0].candidates_tokens == 4500
+    assert records[0].cached_tokens == 7000
+    assert records[0].thoughts_tokens == 1500
+    assert records[0].last_active == datetime(2026, 11, 20, 1, 10, 0, tzinfo=UTC)
