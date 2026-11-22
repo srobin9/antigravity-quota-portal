@@ -36,6 +36,13 @@ class ModelPricing(BaseModel):
     estimated_output_ratio: float = Field(default=0.20, ge=0.0, le=1.0)
     estimated_cached_ratio: float = Field(default=0.10, ge=0.0, le=1.0)
 
+    @field_validator("display_name", "log_pattern", mode="before")
+    @classmethod
+    def _validate_non_empty_str(cls, v: Any) -> str:
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("must be a non-empty string")
+        return v.strip()
+
 
 _DEFAULT_FALLBACK_PRICING = ModelPricing(
     display_name="Default Model Fallback",
@@ -161,6 +168,7 @@ class CurrentWeekUsage(BaseModel):
     tokens_by_model: dict[str, int] = Field(default_factory=dict)
     token_details_by_model: dict[str, ModelTokenUsage] = Field(default_factory=dict)
     spend_by_model: dict[str, float] = Field(default_factory=dict)
+    fallback_models: list[str] = Field(default_factory=list)
     credit_utilization_percentage: float = 0.0
     last_active: datetime | None = None
     wtu_net_usage: float | None = None
@@ -304,6 +312,8 @@ class KPIStats(BaseModel):
     wtu_user_usage: dict[str, dict] = Field(default_factory=dict)
     monitored_projects: list[str] = Field(default_factory=list)
     project_pools: list[ProjectWTUPoolStatus] = Field(default_factory=list)
+    fallback_models: list[str] = Field(default_factory=list)
+    fallback_users_count: int = 0
 
     @field_validator("days_until_reset", "hours_until_reset", mode="before")
     @classmethod

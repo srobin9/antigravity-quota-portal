@@ -18,6 +18,7 @@ import {
   TableRow,
   TableSortLabel,
   TextField,
+  Tooltip,
   Typography,
 } from '@mui/material';
 import SearchIcon from '@mui/icons-material/Search';
@@ -27,6 +28,7 @@ import LockIcon from '@mui/icons-material/Lock';
 import VerifiedUserOutlinedIcon from '@mui/icons-material/VerifiedUserOutlined';
 import EditOutlinedIcon from '@mui/icons-material/EditOutlined';
 import PersonAddOutlinedIcon from '@mui/icons-material/PersonAddOutlined';
+import WarningAmberOutlinedIcon from '@mui/icons-material/WarningAmberOutlined';
 import { ProjectWTUPoolStatus, User } from '../types';
 
 interface UserTableProps {
@@ -455,9 +457,34 @@ export const UserTable: React.FC<UserTableProps> = ({
 
                     {/* Gross Spend */}
                     <TableCell align="right">
-                      <Typography variant="body2" sx={{ fontWeight: 600, color: '#202124' }}>
-                        ${user.current_week.gross_spend_usd.toFixed(2)}
-                      </Typography>
+                      <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 0.35 }}>
+                        <Typography variant="body2" sx={{ fontWeight: 600, color: '#202124' }}>
+                          ${user.current_week.gross_spend_usd.toFixed(2)}
+                        </Typography>
+                        {(user.current_week.fallback_models?.length ?? 0) > 0 && (
+                          <Tooltip
+                            title={`Default fallback pricing applied for unconfigured model(s): ${user.current_week.fallback_models!.join(', ')}`}
+                          >
+                            <Chip
+                              size="small"
+                              icon={
+                                <WarningAmberOutlinedIcon
+                                  sx={{ fontSize: '12px !important', color: '#b06000 !important' }}
+                                />
+                              }
+                              label="Fallback rate"
+                              sx={{
+                                height: 18,
+                                fontSize: 10,
+                                fontWeight: 700,
+                                bgcolor: '#fef7e0',
+                                color: '#b06000',
+                                border: '1px solid #f9ab00',
+                              }}
+                            />
+                          </Tooltip>
+                        )}
+                      </Box>
                     </TableCell>
 
                     {/* Quota Credits */}

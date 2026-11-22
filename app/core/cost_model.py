@@ -1,10 +1,15 @@
 """Cost modeling, token pricing, and hinge point calculations."""
 
 import fnmatch
+import logging
 import math
 import re
+from collections.abc import Mapping
+from typing import Any
 
 from app.db.models import DEFAULT_MODEL_PRICING, ModelPricing, SpendBreakdown
+
+logger = logging.getLogger(__name__)
 
 
 def _finite_non_neg(val: float | int | None, default: float = 0.0) -> float:
@@ -25,20 +30,28 @@ def _safe_non_neg_int(val: int | float | None, default: int = 0) -> int:
     return max(0, int(round(_finite_non_neg(val, float(default)))))
 
 
-def match_model_pricing(model_name: str, pricing_matrix: dict[str, ModelPricing]) -> ModelPricing:
-    """Match a model name from logs to the appropriate ModelPricing configuration.
+def match_model_pricing_with_meta(
+    model_name: str, pricing_matrix: dict[str, ModelPricing]
+) -> tuple[ModelPricing, bool]:
+    """Match a model name from logs to ModelPricing and indicate whether default_fallback was used.
 
-    Supports SQL LIKE style wildcards (e.g., '%3%pro%') or fnmatch patterns.
+    Returns:
+        (matched_pricing, used_fallback) where used_fallback is True when no explicit model key
+        or log_pattern matched and default_fallback had to be applied.
     """
     model_name_lower = (model_name or "").lower().strip()
     short_name = model_name_lower.rsplit("/", 1)[-1]
     lower_map = {k.lower(): v for k, v in pricing_matrix.items()}
+    fallback_pricing = lower_map.get("default_fallback", DEFAULT_MODEL_PRICING["default_fallback"])
+
+    if not model_name_lower or model_name_lower == "default_fallback" or short_name == "default_fallback":
+        return fallback_pricing, True
 
     # 1. Direct key match (case-insensitive)
     if model_name_lower in lower_map:
-        return lower_map[model_name_lower]
+        return lower_map[model_name_lower], False
     if short_name in lower_map:
-        return lower_map[short_name]
+        return lower_map[short_name], False
 
     # 2. Pattern match using log_pattern (sorted by pattern specificity descending).
     # Pass 1 matches against short_name first so path segments (e.g. europe-west3) never
@@ -58,12 +71,12 @@ def match_model_pricing(model_name: str, pricing_matrix: dict[str, ModelPricing]
             # Escape literal regex characters (like '.') then convert SQL LIKE '%' wildcard to '.*'
             regex_pattern = "^" + ".*".join(re.escape(part) for part in pattern.split("%")) + "$"
             if re.search(regex_pattern, candidate):
-                return pricing
+                return pricing, False
 
             # Also try standard glob match
             glob_pattern = pattern.replace("%", "*")
             if fnmatch.fnmatch(candidate, glob_pattern):
-                return pricing
+                return pricing, False
 
         # Secondary pass: allow major-family patterns like '%3-pro%' or '%3-flash%' to match
         # minor point releases (e.g. 'gemini-3.1-pro', 'gemini-3.0-pro', 'gemini-3.0-flash')
@@ -77,10 +90,36 @@ def match_model_pricing(model_name: str, pricing_matrix: dict[str, ModelPricing]
                 for part in pattern.split("%")
             ) + "$"
             if re.search(minor_regex, candidate):
-                return pricing
+                return pricing, False
 
     # 3. Fallback
-    return lower_map.get("default_fallback", DEFAULT_MODEL_PRICING["default_fallback"])
+    return fallback_pricing, True
+
+
+def match_model_pricing(model_name: str, pricing_matrix: dict[str, ModelPricing]) -> ModelPricing:
+    """Match a model name from logs to the appropriate ModelPricing configuration.
+
+    Supports SQL LIKE style wildcards (e.g., '%3%pro%') or fnmatch patterns.
+    """
+    pricing, _ = match_model_pricing_with_meta(model_name, pricing_matrix)
+    return pricing
+
+
+def find_fallback_models(
+    tokens_by_model: Mapping[str, Any] | None,
+    pricing_matrix: dict[str, ModelPricing],
+) -> list[str]:
+    """Return sorted model names from usage that fell back to default_fallback pricing."""
+    if not tokens_by_model:
+        return []
+    unmatched: set[str] = set()
+    for model_name, token_count in tokens_by_model.items():
+        if _safe_non_neg_int(token_count) <= 0:
+            continue
+        _, used_fallback = match_model_pricing_with_meta(model_name, pricing_matrix)
+        if used_fallback:
+            unmatched.add(model_name)
+    return sorted(unmatched)
 
 
 def calculate_blended_rate_per_million(pricing: ModelPricing) -> float:
@@ -260,7 +299,16 @@ def calculate_total_usage_costs(
     spend_by_model: dict[str, float] = {}
 
     for model_name, token_count in tokens_by_model.items():
-        pricing = match_model_pricing(model_name, pricing_matrix)
+        pricing, used_fallback = match_model_pricing_with_meta(model_name, pricing_matrix)
+        if used_fallback and _safe_non_neg_int(token_count) > 0:
+            logger.warning(
+                "Model '%s' did not match any configured pricing rule; applying default_fallback rates "
+                "($%.4f in / $%.4f out / $%.4f cached per 1M tokens).",
+                model_name,
+                pricing.input_price_per_million,
+                pricing.output_price_per_million,
+                pricing.cached_price_per_million,
+            )
         g = (granular_by_model or {}).get(model_name, {})
         model_gross, breakdown = calculate_model_spend(
             token_count=token_count,

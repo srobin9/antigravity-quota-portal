@@ -1395,3 +1395,71 @@ def test_bq_client_merges_metadata_and_inference_response_streams():
     assert records[0].cached_tokens == 7000
     assert records[0].thoughts_tokens == 1500
     assert records[0].last_active == datetime(2026, 11, 20, 1, 10, 0, tzinfo=UTC)
+
+
+def test_evaluator_tracks_fallback_models_and_clears_when_pricing_added(
+    mock_db, mock_bq, mock_identity
+):
+    """Unrecognized models in BigQuery usage populate fallback_models and clear once pricing is configured."""
+    from datetime import UTC, datetime
+
+    from app.bq.bq_client import UserUsageRecord
+    from app.core.evaluator import QuotaEvaluator
+    from app.db.models import ModelPricing
+
+    now = datetime.now(UTC)
+    mock_bq.set_custom_records(
+        [
+            UserUsageRecord(
+                user_email="bob.martin@example.com",
+                model_name="gemini-4-xenon",
+                request_count=5,
+                token_count=1_000_000,
+                prompt_tokens=800_000,
+                candidates_tokens=150_000,
+                cached_tokens=100_000,
+                thoughts_tokens=50_000,
+                fallback_tokens=0,
+                last_active=now,
+            ),
+            UserUsageRecord(
+                user_email="bob.martin@example.com",
+                model_name="gemini-4-carbon",
+                request_count=2,
+                token_count=100_000,
+                prompt_tokens=80_000,
+                candidates_tokens=15_000,
+                cached_tokens=10_000,
+                thoughts_tokens=5_000,
+                fallback_tokens=0,
+                last_active=now,
+            ),
+        ]
+    )
+
+    evaluator = QuotaEvaluator(mock_db, mock_bq, mock_identity)
+    res1 = evaluator.run_evaluation(triggered_by="TEST_FALLBACK")
+    assert res1.success is True
+
+    bob = mock_db.get_user("bob.martin@example.com")
+    assert bob.current_week.fallback_models == ["gemini-4-xenon"]
+    spend_with_fallback = bob.current_week.gross_spend_usd
+
+    # Add explicit pricing for gemini-4-xenon (higher than default_fallback) and re-evaluate
+    cfg = mock_db.get_config()
+    cfg.models["gemini-4-xenon"] = ModelPricing(
+        display_name="Gemini 4 Xenon",
+        log_pattern="%4-xenon%",
+        input_price_per_million=4.00,
+        output_price_per_million=20.00,
+        cached_price_per_million=0.20,
+    )
+    mock_db.update_config(cfg)
+
+    res2 = evaluator.run_evaluation(triggered_by="TEST_FALLBACK_RESOLVED")
+    assert res2.success is True
+
+    bob_after = mock_db.get_user("bob.martin@example.com")
+    assert bob_after.current_week.fallback_models == []
+    assert bob_after.current_week.gross_spend_usd > spend_with_fallback
+

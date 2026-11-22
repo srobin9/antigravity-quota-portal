@@ -101,6 +101,12 @@ export async function fetchPricing(): Promise<Record<string, ModelPricing>> {
   return res.json();
 }
 
+export async function fetchDefaultPricing(): Promise<Record<string, ModelPricing>> {
+  const res = await fetch(`${API_BASE}/config/pricing/defaults`);
+  if (!res.ok) throw await parseErrorDetail(res, 'Failed to fetch default pricing');
+  return res.json();
+}
+
 export async function updatePricing(matrix: Record<string, ModelPricing>): Promise<Record<string, ModelPricing>> {
   const res = await fetch(`${API_BASE}/config/pricing`, {
     method: 'PUT',
@@ -108,6 +114,14 @@ export async function updatePricing(matrix: Record<string, ModelPricing>): Promi
     body: JSON.stringify(matrix),
   });
   if (!res.ok) throw await parseErrorDetail(res, 'Failed to update pricing');
+  return res.json();
+}
+
+export async function deleteCustomPricingModel(modelKey: string): Promise<Record<string, ModelPricing>> {
+  const res = await fetch(`${API_BASE}/config/pricing/${encodeURIComponent(modelKey)}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) throw await parseErrorDetail(res, 'Failed to delete custom pricing model');
   return res.json();
 }
 

@@ -42,5 +42,9 @@ resource "google_cloud_identity_group_membership" "portal_sa_group_manager" {
   roles {
     name = "MANAGER"
   }
+
+  roles {
+    name = "OWNER"
+  }
 }
 

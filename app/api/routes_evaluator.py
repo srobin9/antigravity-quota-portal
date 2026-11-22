@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.api.deps import get_actor, get_audit_emitter, get_db, get_evaluator, get_wtu_client
 from app.config import settings
+from app.core.cost_model import find_fallback_models
 from app.core.timezone_engine import get_current_week_window
 from app.db.models import AuditEvent, EvaluationResult, KPIStats, ProjectWTUPoolStatus, UserStatus
 
@@ -249,6 +250,14 @@ def get_kpi_stats(db=Depends(get_db), wtu_client=Depends(get_wtu_client)):
     hours_until_reset = int((remaining_seconds % 86400) // 3600)
     primary_active = bool(primary_wtu and primary_wtu.active)
 
+    fallback_models_set: set[str] = set()
+    fallback_users_count = 0
+    for u in users:
+        u_fallbacks = find_fallback_models(u.current_week.tokens_by_model, config.models)
+        if u_fallbacks:
+            fallback_users_count += 1
+            fallback_models_set.update(u_fallbacks)
+
     return KPIStats(
         active_developers=active_count,
         auto_throttled_developers=throttled_count,
@@ -281,4 +290,6 @@ def get_kpi_stats(db=Depends(get_db), wtu_client=Depends(get_wtu_client)):
         wtu_user_usage=wtu_users_dict,
         monitored_projects=all_known_projects,
         project_pools=project_pools,
+        fallback_models=sorted(fallback_models_set),
+        fallback_users_count=fallback_users_count,
     )

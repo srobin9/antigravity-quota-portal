@@ -109,12 +109,24 @@ def test_reset_pricing_matrix_endpoint(client):
     response = client.post("/api/config/pricing/reset")
     assert response.status_code == 200
     matrix = response.json()
+    assert "gemini-4-carbon" in matrix
+    assert "gemini-4-neon" in matrix
     assert "gemini-4-argon" in matrix
+    assert "gemini-4-hydrogen" in matrix
     assert "gemini-3-pro" in matrix
     assert "gemini-3.8-flash" in matrix
+    assert matrix["gemini-4-carbon"]["input_price_per_million"] == 2.00
+    assert matrix["gemini-4-carbon"]["output_price_per_million"] == 10.00
+    assert matrix["gemini-4-carbon"]["cached_price_per_million"] == 0.10
+    assert matrix["gemini-4-neon"]["input_price_per_million"] == 3.00
+    assert matrix["gemini-4-neon"]["output_price_per_million"] == 15.00
+    assert matrix["gemini-4-neon"]["cached_price_per_million"] == 0.15
     assert matrix["gemini-4-argon"]["input_price_per_million"] == 1.25
     assert matrix["gemini-4-argon"]["output_price_per_million"] == 10.00
     assert matrix["gemini-4-argon"]["cached_price_per_million"] == 0.125
+    assert matrix["gemini-4-hydrogen"]["input_price_per_million"] == 1.50
+    assert matrix["gemini-4-hydrogen"]["output_price_per_million"] == 7.50
+    assert matrix["gemini-4-hydrogen"]["cached_price_per_million"] == 0.075
     assert matrix["gemini-3-pro"]["input_price_per_million"] == 2.00
     assert matrix["gemini-3-pro"]["input_price_gt_threshold_per_million"] == 4.00
 
@@ -570,6 +582,110 @@ def test_update_config_group_query_failure_returns_502_without_persisting_broken
     assert "Failed to query Cloud Identity group memberships" in resp.json()["detail"]
     # Stored config must remain unchanged
     assert mock_db.get_config().enabled_group == orig_enabled
+
+
+def test_get_default_pricing_matrix_endpoint(client):
+    """Verify GET /api/config/pricing/defaults returns the 17 built-in models."""
+    resp = client.get("/api/config/pricing/defaults")
+    assert resp.status_code == 200
+    defaults = resp.json()
+    assert len(defaults) == 17
+    assert "gemini-4-carbon" in defaults
+    assert "gemini-4-neon" in defaults
+    assert "gemini-4-hydrogen" in defaults
+    assert "default_fallback" in defaults
+
+
+def test_add_and_delete_custom_model_pricing_updates_fallback_warnings(client, mock_db):
+    """Adding a custom model via PUT recalculates spend and clears fallback warnings; DELETE removes it."""
+    from app.db.models import ModelTokenUsage
+
+    bob = mock_db.get_user("bob.martin@example.com")
+    bob.current_week.tokens_by_model = {"gemini-4-xenon": 1_000_000}
+    bob.current_week.token_details_by_model = {
+        "gemini-4-xenon": ModelTokenUsage(
+            total_tokens=1_000_000,
+            prompt_tokens=800_000,
+            candidates_tokens=150_000,
+            cached_tokens=100_000,
+            thoughts_tokens=50_000,
+            fallback_tokens=0,
+        )
+    }
+    mock_db.save_user(bob)
+
+    # Before adding pricing, GET /api/users/{email}, GET /api/users, and GET /api/evaluator/kpis report fallback warning
+    user_before = client.get("/api/users/bob.martin@example.com").json()
+    assert user_before["current_week"]["fallback_models"] == ["gemini-4-xenon"]
+
+    kpis_before = client.get("/api/evaluator/kpis").json()
+    assert "gemini-4-xenon" in kpis_before["fallback_models"]
+    assert kpis_before["fallback_users_count"] >= 1
+
+    # Add custom model via PUT /api/config/pricing
+    matrix = client.get("/api/config/pricing").json()
+    matrix["gemini-4-xenon"] = {
+        "display_name": "Gemini 4 Xenon",
+        "log_pattern": "%4-xenon%",
+        "input_price_per_million": 4.00,
+        "output_price_per_million": 20.00,
+        "cached_price_per_million": 0.20,
+        "estimated_input_ratio": 0.70,
+        "estimated_output_ratio": 0.20,
+        "estimated_cached_ratio": 0.10,
+    }
+    put_resp = client.put("/api/config/pricing", json=matrix)
+    assert put_resp.status_code == 200
+    assert "gemini-4-xenon" in put_resp.json()
+
+    # Spend recalculated: 700k*$4 + 200k*$20 + 100k*$0.20 = $2.80 + $4.00 + $0.02 = $6.82
+    user_after = client.get("/api/users/bob.martin@example.com").json()
+    assert user_after["current_week"]["gross_spend_usd"] == 6.82
+    assert user_after["current_week"]["fallback_models"] == []
+
+    kpis_after = client.get("/api/evaluator/kpis").json()
+    assert "gemini-4-xenon" not in kpis_after["fallback_models"]
+    assert kpis_after["fallback_users_count"] == 0
+
+    # Deleting a built-in default model must fail with HTTP 400
+    del_builtin = client.delete("/api/config/pricing/gemini-4-carbon")
+    assert del_builtin.status_code == 400
+
+    # Deleting a non-existent model must fail with HTTP 404
+    del_missing = client.delete("/api/config/pricing/nonexistent-custom-model")
+    assert del_missing.status_code == 404
+
+    # Deleting the custom model succeeds, recalculates spend to fallback, and restores fallback warning
+    del_custom = client.delete("/api/config/pricing/gemini-4-xenon")
+    assert del_custom.status_code == 200
+    assert "gemini-4-xenon" not in del_custom.json()
+
+    user_reverted = client.get("/api/users/bob.martin@example.com").json()
+    assert user_reverted["current_week"]["fallback_models"] == ["gemini-4-xenon"]
+    # Fallback spend (component-rounded): round(0.525, 2) + 0.75 + round(0.0075, 2) = 0.53 + 0.75 + 0.01 = $1.29
+    assert user_reverted["current_week"]["gross_spend_usd"] == 1.29
+
+
+def test_put_pricing_matrix_rejects_invalid_keys_and_blank_fields(client):
+    """Verify PUT /api/config/pricing returns 422 for blank keys, duplicate keys, or blank display_name/log_pattern."""
+    matrix = client.get("/api/config/pricing").json()
+
+    # Blank key
+    bad_key_matrix = {**matrix, "   ": matrix["gemini-4-carbon"]}
+    assert client.put("/api/config/pricing", json=bad_key_matrix).status_code == 422
+
+    # Duplicate case-insensitive key
+    dup_key_matrix = {**matrix, "GEMINI-4-CARBON": matrix["gemini-4-carbon"]}
+    assert client.put("/api/config/pricing", json=dup_key_matrix).status_code == 422
+
+    # Blank display_name
+    bad_display = {**matrix, "custom-bad": {**matrix["gemini-4-carbon"], "display_name": "   "}}
+    assert client.put("/api/config/pricing", json=bad_display).status_code == 422
+
+    # Blank log_pattern
+    bad_pattern = {**matrix, "custom-bad": {**matrix["gemini-4-carbon"], "log_pattern": ""}}
+    assert client.put("/api/config/pricing", json=bad_pattern).status_code == 422
+
 
 
 

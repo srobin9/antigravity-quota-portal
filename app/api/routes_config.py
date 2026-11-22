@@ -18,7 +18,7 @@ from app.api.deps import (
     get_wtu_client,
 )
 from app.config import settings
-from app.core.cost_model import calculate_total_usage_costs
+from app.core.cost_model import calculate_total_usage_costs, find_fallback_models
 from app.core.state_machine import evaluate_user_state_and_group
 from app.db.models import (
     AppConfig,
@@ -132,6 +132,9 @@ def _recalculate_all_users_spend(
         u.current_week.quota_credits_usd = eff_q
         u.current_week.overage_buffer_usd = eff_o
         u.current_week.spend_by_model = spend_by_model
+        u.current_week.fallback_models = find_fallback_models(
+            tokens_by_model, current_config.models
+        )
         u.current_week.spend_breakdown = spend_breakdown
         u.current_week.gross_spend_usd = gross_spend
         u.current_week.remaining_credit_usd = remaining_credit
@@ -447,6 +450,12 @@ def get_pricing_matrix(db=Depends(get_db)):
     return config.models
 
 
+@router.get("/pricing/defaults", response_model=dict[str, ModelPricing])
+def get_default_pricing_matrix():
+    """Return built-in default model pricing catalog loaded from config/model_pricing.json."""
+    return load_default_model_pricing()
+
+
 @router.put("/pricing", response_model=dict[str, ModelPricing])
 def update_pricing_matrix(
     matrix: dict[str, ModelPricing],
@@ -456,15 +465,42 @@ def update_pricing_matrix(
     audit_emitter=Depends(get_audit_emitter),
     evaluator=Depends(get_evaluator),
 ):
+    default_matrix = load_default_model_pricing()
+    default_key_by_lower = {k.lower(): k for k in default_matrix}
+    cleaned_matrix: dict[str, ModelPricing] = {}
+    seen_lower: set[str] = set()
+    for raw_key, pricing_val in matrix.items():
+        clean_key = (raw_key or "").strip()
+        if not clean_key:
+            raise HTTPException(status_code=422, detail="Model key must be a non-empty string")
+        lower_key = clean_key.lower()
+        if lower_key in seen_lower:
+            raise HTTPException(
+                status_code=422, detail=f"Duplicate model pricing key: '{clean_key}'"
+            )
+        seen_lower.add(lower_key)
+        canonical_key = default_key_by_lower.get(lower_key, clean_key)
+        cleaned_matrix[canonical_key] = pricing_val
+
     lock = getattr(evaluator, "_eval_lock", None) or get_evaluator()._eval_lock
     with lock:
         actor = get_actor(request)
         config = db.get_config()
-        config.models = merge_model_pricing_with_defaults(matrix)
+        prev_keys = set(config.models.keys())
+        config.models = merge_model_pricing_with_defaults(cleaned_matrix)
         db.update_config(config)
         _recalculate_all_users_spend(
             db, config, identity=identity, audit_emitter=audit_emitter, actor=actor
         )
+
+        new_keys = set(config.models.keys())
+        details: dict[str, Any] = {"updated_models": list(cleaned_matrix.keys())}
+        added = sorted(new_keys - prev_keys)
+        removed = sorted(prev_keys - new_keys)
+        if added:
+            details["added_models"] = added
+        if removed:
+            details["removed_models"] = removed
 
         db.add_audit_event(
             AuditEvent(
@@ -472,7 +508,60 @@ def update_pricing_matrix(
                 timestamp=datetime.now(UTC),
                 action="PRICING_MATRIX_UPDATE",
                 triggered_by=actor,
-                details={"updated_models": list(matrix.keys())},
+                details=details,
+            )
+        )
+        return config.models
+
+
+@router.delete("/pricing/{model_key}", response_model=dict[str, ModelPricing])
+def delete_custom_pricing_model(
+    model_key: str,
+    request: Request = None,
+    db=Depends(get_db),
+    identity=Depends(get_identity),
+    audit_emitter=Depends(get_audit_emitter),
+    evaluator=Depends(get_evaluator),
+):
+    """Delete a custom (non-default) model pricing entry and recalculate user spend."""
+    target_key = (model_key or "").strip()
+    if not target_key:
+        raise HTTPException(status_code=422, detail="Model key must be a non-empty string")
+
+    default_keys_lower = {k.lower() for k in load_default_model_pricing()}
+    if target_key.lower() in default_keys_lower:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Cannot delete built-in default model '{target_key}'. "
+                "Edit its rates in the Pricing Matrix or update config/model_pricing.json."
+            ),
+        )
+
+    lock = getattr(evaluator, "_eval_lock", None) or get_evaluator()._eval_lock
+    with lock:
+        actor = get_actor(request)
+        config = db.get_config()
+        matched_key = next(
+            (k for k in config.models if k == target_key or k.lower() == target_key.lower()),
+            None,
+        )
+        if matched_key is None:
+            raise HTTPException(status_code=404, detail=f"Custom model '{target_key}' not found")
+
+        del config.models[matched_key]
+        db.update_config(config)
+        _recalculate_all_users_spend(
+            db, config, identity=identity, audit_emitter=audit_emitter, actor=actor
+        )
+
+        db.add_audit_event(
+            AuditEvent(
+                event_id=f"evt-price-del-{uuid.uuid4().hex[:8]}",
+                timestamp=datetime.now(UTC),
+                action="PRICING_MATRIX_UPDATE",
+                triggered_by=actor,
+                details={"removed_models": [matched_key]},
             )
         )
         return config.models

@@ -36,6 +36,7 @@ export interface CurrentWeekUsage {
   tokens_by_model: Record<string, number>;
   token_details_by_model?: Record<string, ModelTokenUsage>;
   spend_by_model: Record<string, number>;
+  fallback_models?: string[];
   credit_utilization_percentage: number;
   last_active?: string | null;
   wtu_net_usage?: number | null;
@@ -139,6 +140,8 @@ export interface KPIStats {
   }>;
   monitored_projects?: string[];
   project_pools?: ProjectWTUPoolStatus[];
+  fallback_models?: string[];
+  fallback_users_count?: number;
 }
 
 export interface AuditEvent {

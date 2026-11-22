@@ -4,6 +4,7 @@ import {
   Avatar,
   Box,
   Button,
+  Chip,
   Divider,
   Drawer,
   FormControl,
@@ -19,12 +20,14 @@ import {
   RadioGroup,
   Switch,
   TextField,
+  Tooltip,
   Typography,
 } from '@mui/material';
 import CloseIcon from '@mui/icons-material/Close';
 import SaveIcon from '@mui/icons-material/Save';
 import AccountBalanceWalletIcon from '@mui/icons-material/AccountBalanceWallet';
 import LayersIcon from '@mui/icons-material/Layers';
+import WarningAmberOutlinedIcon from '@mui/icons-material/WarningAmberOutlined';
 import { AppConfig, User, UserUpdatePayload } from '../types';
 
 interface UserDrawerProps {
@@ -33,6 +36,7 @@ interface UserDrawerProps {
   open: boolean;
   onClose: () => void;
   onSave: (email: string, payload: UserUpdatePayload) => Promise<void>;
+  onOpenPricing?: (modelName?: string) => void;
 }
 
 export const UserDrawer: React.FC<UserDrawerProps> = ({
@@ -41,6 +45,7 @@ export const UserDrawer: React.FC<UserDrawerProps> = ({
   open,
   onClose,
   onSave,
+  onOpenPricing,
 }) => {
   const [hasCustomQuota, setHasCustomQuota] = useState(false);
   const [selectedPreset, setSelectedPreset] = useState<string>('10');
@@ -275,36 +280,95 @@ export const UserDrawer: React.FC<UserDrawerProps> = ({
         {/* Model Breakdown */}
         <Typography variant="subtitle2" sx={{ mb: 1.5, display: 'flex', alignItems: 'center', gap: 1 }}>
           <LayersIcon fontSize="small" sx={{ color: '#1a73e8' }} />
-          Model Token & Spend Breakdown
+          Model Token &amp; Spend Breakdown
         </Typography>
         <Paper elevation={0} sx={{ p: 2, mb: 3, border: '1px solid #dadce0', bgcolor: '#ffffff' }}>
-          {Object.keys(currentUsage.tokens_by_model).length === 0 ? (
-            <Typography variant="body2" sx={{ color: '#5f6368' }}>
-              No inference requests logged yet this week.
-            </Typography>
-          ) : (
-            Object.entries(currentUsage.tokens_by_model).map(([model, tokens]) => {
-              const spend = currentUsage.spend_by_model[model] || 0;
-              const pct = currentUsage.total_tokens > 0 ? (tokens / currentUsage.total_tokens) * 100 : 0;
+          {(() => {
+            const fallbackSet = new Set(currentUsage.fallback_models || []);
+            const entries = Object.entries(currentUsage.tokens_by_model);
+            if (entries.length === 0) {
               return (
-                <Box key={model} sx={{ mb: 2, '&:last-child': { mb: 0 } }}>
-                  <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.5 }}>
-                    <Typography variant="body2" sx={{ fontWeight: 600 }}>
-                      {model}
-                    </Typography>
-                    <Typography variant="body2" sx={{ color: '#202124', fontWeight: 600 }}>
-                      ${spend.toFixed(2)} ({tokens.toLocaleString()} tokens)
-                    </Typography>
-                  </Box>
-                  <LinearProgress
-                    variant="determinate"
-                    value={pct}
-                    sx={{ height: 6, borderRadius: 3, bgcolor: '#e8eaed' }}
-                  />
-                </Box>
+                <Typography variant="body2" sx={{ color: '#5f6368' }}>
+                  No inference requests logged yet this week.
+                </Typography>
               );
-            })
-          )}
+            }
+            return (
+              <>
+                {fallbackSet.size > 0 && (
+                  <Alert
+                    severity="warning"
+                    icon={<WarningAmberOutlinedIcon fontSize="small" />}
+                    sx={{ mb: 2, py: 0.5, border: '1px solid #f9ab00' }}
+                    action={
+                      onOpenPricing ? (
+                        <Button
+                          color="inherit"
+                          size="small"
+                          sx={{ fontWeight: 700, whiteSpace: 'nowrap' }}
+                          onClick={() => onOpenPricing(Array.from(fallbackSet)[0])}
+                        >
+                          Add Pricing
+                        </Button>
+                      ) : undefined
+                    }
+                  >
+                    <Typography variant="caption" sx={{ display: 'block', lineHeight: 1.4 }}>
+                      <strong>Fallback pricing applied:</strong> {fallbackSet.size} model(s) did not match Pricing Matrix rules and were estimated using <code>default_fallback</code> rates.
+                    </Typography>
+                  </Alert>
+                )}
+                {entries.map(([model, tokens]) => {
+                  const spend = currentUsage.spend_by_model[model] || 0;
+                  const pct = currentUsage.total_tokens > 0 ? (tokens / currentUsage.total_tokens) * 100 : 0;
+                  const isFallback = fallbackSet.has(model);
+                  return (
+                    <Box key={model} sx={{ mb: 2, '&:last-child': { mb: 0 } }}>
+                      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 1, mb: 0.5 }}>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexWrap: 'wrap' }}>
+                          <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                            {model}
+                          </Typography>
+                          {isFallback && (
+                            <Tooltip title="Unrecognized model priced using Default Model Fallback rates. Click to add pricing in Pricing Matrix.">
+                              <Chip
+                                size="small"
+                                icon={<WarningAmberOutlinedIcon sx={{ fontSize: '14px !important', color: '#b06000 !important' }} />}
+                                label="Fallback Pricing"
+                                clickable={Boolean(onOpenPricing)}
+                                onClick={onOpenPricing ? () => onOpenPricing(model) : undefined}
+                                sx={{
+                                  height: 20,
+                                  fontSize: 10.5,
+                                  fontWeight: 700,
+                                  bgcolor: '#fef7e0',
+                                  color: '#b06000',
+                                  border: '1px solid #f9ab00',
+                                }}
+                              />
+                            </Tooltip>
+                          )}
+                        </Box>
+                        <Typography variant="body2" sx={{ color: '#202124', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                          ${spend.toFixed(2)} ({tokens.toLocaleString()} tokens)
+                        </Typography>
+                      </Box>
+                      <LinearProgress
+                        variant="determinate"
+                        value={pct}
+                        sx={{
+                          height: 6,
+                          borderRadius: 3,
+                          bgcolor: '#e8eaed',
+                          '& .MuiLinearProgress-bar': isFallback ? { bgcolor: '#f9ab00' } : undefined,
+                        }}
+                      />
+                    </Box>
+                  );
+                })}
+              </>
+            );
+          })()}
         </Paper>
 
         {/* Hinge Point Breakdown */}

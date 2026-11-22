@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   AppBar,
@@ -19,6 +19,7 @@ import SettingsOutlinedIcon from '@mui/icons-material/SettingsOutlined';
 import PriceCheckOutlinedIcon from '@mui/icons-material/PriceCheckOutlined';
 import HistoryOutlinedIcon from '@mui/icons-material/HistoryOutlined';
 import RefreshIcon from '@mui/icons-material/Refresh';
+import WarningAmberOutlinedIcon from '@mui/icons-material/WarningAmberOutlined';
 
 import { DisclaimerBanner } from './components/DisclaimerBanner';
 import { KPISummary } from './components/KPISummary';
@@ -32,6 +33,7 @@ import { AddUserModal } from './components/AddUserModal';
 import {
   createUser,
   fetchConfig,
+  fetchDefaultPricing,
   fetchKPIs,
   fetchPricing,
   fetchUsers,
@@ -54,6 +56,7 @@ export const App: React.FC = () => {
   const [users, setUsers] = useState<User[]>([]);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [pricing, setPricing] = useState<Record<string, ModelPricing>>({});
+  const [defaultModelKeys, setDefaultModelKeys] = useState<string[]>([]);
   const [kpis, setKPIs] = useState<KPIStats | null>(null);
 
   const [loading, setLoading] = useState(true);
@@ -67,6 +70,7 @@ export const App: React.FC = () => {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [pricingOpen, setPricingOpen] = useState(false);
+  const [initialModelToAdd, setInitialModelToAdd] = useState<string | null>(null);
   const [auditOpen, setAuditOpen] = useState(false);
   const [addUserOpen, setAddUserOpen] = useState(false);
 
@@ -85,17 +89,21 @@ export const App: React.FC = () => {
     const seq = ++loadSeqRef.current;
     setLoading(true);
     try {
-      const [usersData, configData, pricingData, kpisData] = await Promise.all([
+      const [usersData, configData, pricingData, kpisData, defaultPricingData] = await Promise.all([
         fetchUsers(),
         fetchConfig(),
         fetchPricing(),
         fetchKPIs(),
+        fetchDefaultPricing().catch(() => null),
       ]);
       if (seq !== loadSeqRef.current) return;
       setUsers(usersData);
       setConfig(configData);
       setPricing(pricingData);
       setKPIs(kpisData);
+      if (defaultPricingData) {
+        setDefaultModelKeys(Object.keys(defaultPricingData));
+      }
     } catch (err) {
       if (seq !== loadSeqRef.current) return;
       console.error('Failed to load portal data:', err);
@@ -105,6 +113,26 @@ export const App: React.FC = () => {
         setLoading(false);
       }
     }
+  };
+
+  const unmatchedModels = useMemo(() => {
+    const set = new Set<string>(kpis?.fallback_models || []);
+    for (const u of users) {
+      for (const m of u.current_week.fallback_models || []) {
+        set.add(m);
+      }
+    }
+    return Array.from(set).sort();
+  }, [kpis, users]);
+
+  const fallbackUsersCount = useMemo(() => {
+    const fromUsers = users.filter((u) => (u.current_week.fallback_models?.length ?? 0) > 0).length;
+    return kpis?.fallback_users_count ?? fromUsers;
+  }, [kpis, users]);
+
+  const handleOpenPricing = (modelName?: string) => {
+    setInitialModelToAdd(modelName || null);
+    setPricingOpen(true);
   };
 
   useEffect(() => {
@@ -328,10 +356,26 @@ export const App: React.FC = () => {
               variant="text"
               size="small"
               startIcon={<PriceCheckOutlinedIcon />}
-              onClick={() => setPricingOpen(true)}
-              sx={{ color: '#5f6368' }}
+              onClick={() => handleOpenPricing()}
+              sx={{ color: unmatchedModels.length > 0 ? '#b06000' : '#5f6368', fontWeight: unmatchedModels.length > 0 ? 700 : 500 }}
             >
               Pricing Matrix
+              {unmatchedModels.length > 0 && (
+                <Chip
+                  size="small"
+                  label={unmatchedModels.length}
+                  sx={{
+                    ml: 0.75,
+                    height: 18,
+                    minWidth: 18,
+                    fontSize: 11,
+                    fontWeight: 700,
+                    bgcolor: '#fef7e0',
+                    color: '#b06000',
+                    border: '1px solid #f9ab00',
+                  }}
+                />
+              )}
             </Button>
 
             <Button
@@ -369,6 +413,68 @@ export const App: React.FC = () => {
         {/* Global Estimation Notice Banner */}
         <DisclaimerBanner />
 
+        {/* Unrecognized / Fallback Pricing Warning Banner */}
+        {unmatchedModels.length > 0 && (
+          <Alert
+            severity="warning"
+            icon={<WarningAmberOutlinedIcon />}
+            sx={{
+              mb: 3,
+              border: '1px solid #f9ab00',
+              borderRadius: 2,
+              bgcolor: '#fef7e0',
+              color: '#5f370e',
+              alignItems: 'center',
+            }}
+            action={
+              <Button
+                variant="contained"
+                size="small"
+                onClick={() => handleOpenPricing(unmatchedModels[0])}
+                sx={{
+                  bgcolor: '#b06000',
+                  '&:hover': { bgcolor: '#8c4a00' },
+                  fontWeight: 600,
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                Add to Pricing Matrix
+              </Button>
+            }
+          >
+            <Box>
+              <Typography variant="body2" sx={{ fontWeight: 700, mb: 0.5 }}>
+                Fallback Pricing Active ({unmatchedModels.length} unrecognized model{unmatchedModels.length > 1 ? 's' : ''}, {fallbackUsersCount} affected developer{fallbackUsersCount !== 1 ? 's' : ''})
+              </Typography>
+              <Typography variant="body2" sx={{ fontSize: 13, lineHeight: 1.45 }}>
+                The following model(s) from inference logs did not match any Pricing Matrix entry and are currently priced at{' '}
+                <strong>
+                  Default Fallback (${pricing.default_fallback?.input_price_per_million ?? 0.75} in / ${pricing.default_fallback?.output_price_per_million ?? 3.75} out / ${pricing.default_fallback?.cached_price_per_million ?? 0.075} cached per 1M)
+                </strong>
+                , which may cause inaccurate credit spend calculations:
+              </Typography>
+              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, mt: 0.75 }}>
+                {unmatchedModels.map((modelName) => (
+                  <Chip
+                    key={modelName}
+                    size="small"
+                    label={modelName}
+                    onClick={() => handleOpenPricing(modelName)}
+                    sx={{
+                      fontFamily: 'monospace',
+                      fontWeight: 700,
+                      fontSize: 11.5,
+                      bgcolor: '#ffffff',
+                      color: '#7c4a03',
+                      border: '1px solid #f9ab00',
+                    }}
+                  />
+                ))}
+              </Box>
+            </Box>
+          </Alert>
+        )}
+
         {/* Top KPI Metric Cards */}
         <KPISummary
           kpis={kpis}
@@ -403,6 +509,10 @@ export const App: React.FC = () => {
         open={drawerOpen}
         onClose={() => setDrawerOpen(false)}
         onSave={handleSaveUser}
+        onOpenPricing={(modelName) => {
+          setDrawerOpen(false);
+          handleOpenPricing(modelName);
+        }}
       />
 
       {/* Modals */}
@@ -415,8 +525,14 @@ export const App: React.FC = () => {
 
       <PricingModal
         pricing={pricing}
+        defaultModelKeys={defaultModelKeys}
+        unmatchedModels={unmatchedModels}
+        initialModelToAdd={initialModelToAdd}
         open={pricingOpen}
-        onClose={() => setPricingOpen(false)}
+        onClose={() => {
+          setPricingOpen(false);
+          setInitialModelToAdd(null);
+        }}
         onSave={handleSavePricing}
         onError={(msg) => showNotification(msg, 'error')}
       />

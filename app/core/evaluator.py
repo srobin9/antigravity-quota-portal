@@ -8,7 +8,7 @@ from typing import Any
 
 from app.bq.wtu_client import derive_license_tier
 from app.config import settings
-from app.core.cost_model import calculate_total_usage_costs
+from app.core.cost_model import calculate_total_usage_costs, find_fallback_models
 from app.core.state_machine import evaluate_user_state_and_group
 from app.core.timezone_engine import get_current_week_window, is_new_week
 from app.db.models import (
@@ -511,6 +511,9 @@ class QuotaEvaluator:
                     prev_week_copy.net_billable_cost_usd = c_net
                     prev_week_copy.spend_breakdown = c_breakdown
                     prev_week_copy.spend_by_model = c_spend_by_model
+                    prev_week_copy.fallback_models = find_fallback_models(
+                        closing_bq["tokens_by_model"], config.models
+                    )
                     prev_week_copy.credit_utilization_percentage = c_util
 
                 pending_user_snapshot: WeeklySnapshot | None = None
@@ -570,6 +573,9 @@ class QuotaEvaluator:
                 user.current_week.tokens_by_model = bq_data["tokens_by_model"]
                 user.current_week.token_details_by_model = bq_data.get("token_details_by_model", {})
                 user.current_week.spend_by_model = spend_by_model
+                user.current_week.fallback_models = find_fallback_models(
+                    bq_data["tokens_by_model"], config.models
+                )
                 user.current_week.credit_utilization_percentage = utilization_pct
                 if bq_data.get("last_active"):
                     user.current_week.last_active = bq_data["last_active"]

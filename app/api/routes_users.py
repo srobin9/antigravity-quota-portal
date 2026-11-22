@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from app.api.deps import get_actor, get_db, get_evaluator, get_identity, get_wtu_client
 from app.bq.wtu_client import derive_license_tier
 from app.config import settings
+from app.core.cost_model import find_fallback_models
 from app.core.state_machine import evaluate_user_state_and_group
 from app.core.timezone_engine import get_current_week_window
 from app.db.models import (
@@ -67,6 +68,12 @@ def list_users(
     db=Depends(get_db),
 ):
     users = db.list_users()
+    config = db.get_config()
+
+    for u in users:
+        u.current_week.fallback_models = find_fallback_models(
+            u.current_week.tokens_by_model, config.models
+        )
 
     # Filtering
     if search:
@@ -79,7 +86,6 @@ def list_users(
 
     if project_id:
         pid = project_id.strip()
-        config = db.get_config()
         monitored = config.monitored_projects or settings.monitored_project_ids
         default_proj = monitored[0] if monitored else settings.PROJECT_ID
         users = [u for u in users if (u.project_id or default_proj) == pid]
@@ -109,6 +115,10 @@ def get_user(email: str, db=Depends(get_db)):
     user = db.get_user(email)
     if not user:
         raise HTTPException(status_code=404, detail=f"User {email} not found")
+    config = db.get_config()
+    user.current_week.fallback_models = find_fallback_models(
+        user.current_week.tokens_by_model, config.models
+    )
     return user
 
 
@@ -439,6 +449,9 @@ def update_user(
                 )
             )
 
+        user.current_week.fallback_models = find_fallback_models(
+            user.current_week.tokens_by_model, config.models
+        )
         return user
 
 
@@ -539,4 +552,7 @@ def toggle_user_lock(
             )
         )
 
+        user.current_week.fallback_models = find_fallback_models(
+            user.current_week.tokens_by_model, config.models
+        )
         return user

@@ -4,24 +4,44 @@ from app.core.cost_model import (
     calculate_blended_rate_per_million,
     calculate_model_spend,
     calculate_total_usage_costs,
+    find_fallback_models,
     match_model_pricing,
+    match_model_pricing_with_meta,
 )
 from app.db.models import DEFAULT_MODEL_PRICING, load_default_model_pricing
 
 
 def test_load_default_model_pricing_from_external_config():
     pricing_map = load_default_model_pricing()
-    assert len(pricing_map) == 14
+    assert len(pricing_map) == 17
+    assert "gemini-4-carbon" in pricing_map
+    assert "gemini-4-neon" in pricing_map
     assert "gemini-4-argon" in pricing_map
+    assert "gemini-4-hydrogen" in pricing_map
     assert "gemini-3-pro" in pricing_map
     assert "gemini-3.8-flash" in pricing_map
     assert "claude-opus-5.5" in pricing_map
     assert "claude-sonnet-5.5" in pricing_map
+    assert pricing_map["gemini-4-carbon"].display_name == "Gemini 4 Carbon"
+    assert pricing_map["gemini-4-carbon"].log_pattern == "%4-carbon%"
+    assert pricing_map["gemini-4-carbon"].input_price_per_million == 2.00
+    assert pricing_map["gemini-4-carbon"].output_price_per_million == 10.00
+    assert pricing_map["gemini-4-carbon"].cached_price_per_million == 0.10
+    assert pricing_map["gemini-4-neon"].display_name == "Gemini 4 Neon"
+    assert pricing_map["gemini-4-neon"].log_pattern == "%4-neon%"
+    assert pricing_map["gemini-4-neon"].input_price_per_million == 3.00
+    assert pricing_map["gemini-4-neon"].output_price_per_million == 15.00
+    assert pricing_map["gemini-4-neon"].cached_price_per_million == 0.15
     assert pricing_map["gemini-4-argon"].display_name == "Gemini 4 Argon"
     assert pricing_map["gemini-4-argon"].log_pattern == "%4-argon%"
     assert pricing_map["gemini-4-argon"].input_price_per_million == 1.25
     assert pricing_map["gemini-4-argon"].output_price_per_million == 10.00
     assert pricing_map["gemini-4-argon"].cached_price_per_million == 0.125
+    assert pricing_map["gemini-4-hydrogen"].display_name == "Gemini 4 Hydrogen"
+    assert pricing_map["gemini-4-hydrogen"].log_pattern == "%4-hydrogen%"
+    assert pricing_map["gemini-4-hydrogen"].input_price_per_million == 1.50
+    assert pricing_map["gemini-4-hydrogen"].output_price_per_million == 7.50
+    assert pricing_map["gemini-4-hydrogen"].cached_price_per_million == 0.075
     assert pricing_map["gemini-3-pro"].input_price_per_million == 2.00
     assert pricing_map["gemini-3-pro"].input_price_gt_threshold_per_million == 4.00
     assert pricing_map["gemini-3.8-flash"].input_price_per_million == 0.75
@@ -30,11 +50,29 @@ def test_load_default_model_pricing_from_external_config():
 
 def test_match_model_pricing():
     # Exact and pattern matching tests
+    pricing_carbon = match_model_pricing("models/gemini-4-carbon-high", DEFAULT_MODEL_PRICING)
+    assert pricing_carbon.display_name == "Gemini 4 Carbon"
+    assert pricing_carbon.input_price_per_million == 2.00
+    assert pricing_carbon.output_price_per_million == 10.00
+    assert pricing_carbon.cached_price_per_million == 0.10
+
+    pricing_neon = match_model_pricing("gemini-4-neon-xhigh", DEFAULT_MODEL_PRICING)
+    assert pricing_neon.display_name == "Gemini 4 Neon"
+    assert pricing_neon.input_price_per_million == 3.00
+    assert pricing_neon.output_price_per_million == 15.00
+    assert pricing_neon.cached_price_per_million == 0.15
+
     pricing_argon = match_model_pricing("models/gemini-4-argon-medium", DEFAULT_MODEL_PRICING)
     assert pricing_argon.display_name == "Gemini 4 Argon"
     assert pricing_argon.input_price_per_million == 1.25
     assert pricing_argon.output_price_per_million == 10.00
     assert pricing_argon.cached_price_per_million == 0.125
+
+    pricing_hydrogen = match_model_pricing("models/gemini-4-hydrogen-preview", DEFAULT_MODEL_PRICING)
+    assert pricing_hydrogen.display_name == "Gemini 4 Hydrogen"
+    assert pricing_hydrogen.input_price_per_million == 1.50
+    assert pricing_hydrogen.output_price_per_million == 7.50
+    assert pricing_hydrogen.cached_price_per_million == 0.075
 
     pricing = match_model_pricing("gemini-3-pro", DEFAULT_MODEL_PRICING)
     assert pricing.display_name == "Gemini 3.1 Pro / 3.0 Pro"
@@ -221,6 +259,80 @@ def test_gemini_4_argon_spend_calculation():
     assert breakdown.input_spend_usd == 0.875
     assert breakdown.output_spend_usd == 2.00
     assert breakdown.cached_spend_usd == 0.0125
+
+
+def test_gemini_4_carbon_neon_hydrogen_spend_calculation():
+    # Carbon: 0.70*2.00 + 0.20*10.00 + 0.10*0.10 = 1.40 + 2.00 + 0.01 = 3.41
+    carbon_pricing = DEFAULT_MODEL_PRICING["gemini-4-carbon"]
+    assert round(calculate_blended_rate_per_million(carbon_pricing), 4) == 3.41
+    carbon_spend, _ = calculate_model_spend(
+        token_count=1_000_000,
+        pricing=carbon_pricing,
+        prompt_tokens=800_000,
+        candidates_tokens=150_000,
+        cached_tokens=100_000,
+        thoughts_tokens=50_000,
+        fallback_tokens=0,
+    )
+    assert carbon_spend == 3.41
+
+    # Neon: 0.70*3.00 + 0.20*15.00 + 0.10*0.15 = 2.10 + 3.00 + 0.015 = 5.115
+    neon_pricing = DEFAULT_MODEL_PRICING["gemini-4-neon"]
+    assert round(calculate_blended_rate_per_million(neon_pricing), 4) == 5.115
+    neon_spend, _ = calculate_model_spend(
+        token_count=1_000_000,
+        pricing=neon_pricing,
+        prompt_tokens=800_000,
+        candidates_tokens=150_000,
+        cached_tokens=100_000,
+        thoughts_tokens=50_000,
+        fallback_tokens=0,
+    )
+    assert neon_spend == 5.115
+
+    # Hydrogen: 0.80*1.50 + 0.15*7.50 + 0.05*0.075 = 1.20 + 1.125 + 0.00375 = 2.32875
+    hydrogen_pricing = DEFAULT_MODEL_PRICING["gemini-4-hydrogen"]
+    assert round(calculate_blended_rate_per_million(hydrogen_pricing), 5) == 2.32875
+
+
+def test_match_model_pricing_with_meta_and_find_fallback_models(caplog):
+    pricing_carbon, used_fb_carbon = match_model_pricing_with_meta(
+        "models/gemini-4-carbon", DEFAULT_MODEL_PRICING
+    )
+    assert pricing_carbon.display_name == "Gemini 4 Carbon"
+    assert used_fb_carbon is False
+
+    pricing_unknown, used_fb_unknown = match_model_pricing_with_meta(
+        "gemini-4-xenon", DEFAULT_MODEL_PRICING
+    )
+    assert pricing_unknown.display_name == "Default Model Fallback"
+    assert used_fb_unknown is True
+
+    _, used_fb_explicit = match_model_pricing_with_meta("default_fallback", DEFAULT_MODEL_PRICING)
+    assert used_fb_explicit is True
+
+    fallbacks = find_fallback_models(
+        {
+            "gemini-4-carbon": 500_000,
+            "gemini-4-xenon": 200_000,
+            "zero-token-unknown": 0,
+            "models/custom-mystery-model": 100_000,
+        },
+        DEFAULT_MODEL_PRICING,
+    )
+    assert fallbacks == ["gemini-4-xenon", "models/custom-mystery-model"]
+
+    with caplog.at_level("WARNING", logger="app.core.cost_model"):
+        calculate_total_usage_costs(
+            {"gemini-4-xenon": 100_000, "gemini-4-carbon": 100_000},
+            DEFAULT_MODEL_PRICING,
+            quota_credits=10.0,
+            overage_buffer=2.0,
+        )
+    assert "gemini-4-xenon" in caplog.text
+    assert "default_fallback" in caplog.text
+    assert "gemini-4-carbon" not in caplog.text
+
 
 
 

@@ -179,16 +179,36 @@ stateDiagram-v2
 
 ## 5. Token Cost Modeling Engine & "Hinge Points"
 
-### 5.1 Externalized 14-Entry Pricing Catalog (`config/model_pricing.json`)
+### 5.1 Externalized 17-Entry Pricing Catalog (`config/model_pricing.json`)
 
 > [!IMPORTANT]
-> **Illustrative Retail Pricing Baseline (Customer-Customizable):** [`config/model_pricing.json`](config/model_pricing.json) is provided solely as a starting template using published retail token prices. There is no commitment to maintain model availability or pricing accuracy in this repository. Organizations should review, verify, and customize [`config/model_pricing.json`](config/model_pricing.json) (or update rates in the **Pricing Matrix** modal) to match their enabled models and negotiated enterprise pricing.
+> **Illustrative Retail Pricing Baseline (Customer-Customizable):** [`config/model_pricing.json`](config/model_pricing.json) is provided solely as a starting template using published retail token prices. There is no commitment to maintain model availability or pricing accuracy in this repository. Organizations should review, verify, and customize [`config/model_pricing.json`](config/model_pricing.json) (or add/update rates in the **Pricing Matrix** modal) to match their enabled models and negotiated enterprise pricing.
 
-The portal loads its default 14-entry pricing catalog from [`config/model_pricing.json`](config/model_pricing.json), supporting both granular token telemetry (`promptTokenCount`, `candidatesTokenCount`, `cachedContentTokenCount`, `thoughtsTokenCount`) with context-length tiering (`<=200k` vs. `>200k` prompt tokens via `context_tier_threshold_tokens` and `*_price_gt_threshold_per_million`) and blended fallback ratios when granular counts are absent:
+The portal loads its default 17-entry pricing catalog from [`config/model_pricing.json`](config/model_pricing.json), supporting both granular token telemetry (`promptTokenCount`, `candidatesTokenCount`, `cachedContentTokenCount`, `thoughtsTokenCount`) with context-length tiering (`<=200k` vs. `>200k` prompt tokens via `context_tier_threshold_tokens` and `*_price_gt_threshold_per_million`) and blended fallback ratios when granular counts are absent:
 
 ```json
 {
   "models": {
+    "gemini-4-carbon": {
+      "display_name": "Gemini 4 Carbon",
+      "log_pattern": "%4-carbon%",
+      "input_price_per_million": 2.00,
+      "output_price_per_million": 10.00,
+      "cached_price_per_million": 0.10,
+      "estimated_input_ratio": 0.70,
+      "estimated_output_ratio": 0.20,
+      "estimated_cached_ratio": 0.10
+    },
+    "gemini-4-neon": {
+      "display_name": "Gemini 4 Neon",
+      "log_pattern": "%4-neon%",
+      "input_price_per_million": 3.00,
+      "output_price_per_million": 15.00,
+      "cached_price_per_million": 0.15,
+      "estimated_input_ratio": 0.70,
+      "estimated_output_ratio": 0.20,
+      "estimated_cached_ratio": 0.10
+    },
     "gemini-4-argon": {
       "display_name": "Gemini 4 Argon",
       "log_pattern": "%4-argon%",
@@ -198,6 +218,16 @@ The portal loads its default 14-entry pricing catalog from [`config/model_pricin
       "estimated_input_ratio": 0.70,
       "estimated_output_ratio": 0.20,
       "estimated_cached_ratio": 0.10
+    },
+    "gemini-4-hydrogen": {
+      "display_name": "Gemini 4 Hydrogen",
+      "log_pattern": "%4-hydrogen%",
+      "input_price_per_million": 1.50,
+      "output_price_per_million": 7.50,
+      "cached_price_per_million": 0.075,
+      "estimated_input_ratio": 0.80,
+      "estimated_output_ratio": 0.15,
+      "estimated_cached_ratio": 0.05
     },
     "gemini-3-pro": {
       "display_name": "Gemini 3.1 Pro / 3.0 Pro",
